@@ -25,6 +25,7 @@ const SORT_COLUMNS: Record<string, string> = {
 };
 
 const FILE_TYPES: FileType[] = ["document", "image", "video", "audio", "other"];
+const SIGNED_URL_TTL = 60 * 60; // seconds; the bucket is private, so links expire
 const EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
 
 // Supabase errors are Error subclasses whose fields don't survive console.log
@@ -54,11 +55,49 @@ const getAuthUser = async () => {
   return { supabase, user };
 };
 
+type SessionClient = Awaited<ReturnType<typeof createSessionClient>>;
+
+// Row ownership: files."accountId" is the uploader's auth user id (set server-side in
+// uploadFile, never from the client). Every query below filters on it explicitly, so
+// isolation does not depend on RLS alone; RLS (supabase/schema.sql) is the second layer.
+const OWNER_COLUMN = "accountId";
+
+// PostgREST filter: rows I own OR rows whose `users` array contains my email.
+const ownedOrSharedFilter = (userId: string, email?: string) => {
+  const owned = `${OWNER_COLUMN}.eq.${userId}`;
+  if (!email) return owned;
+  const quoted = `"${email.toLowerCase().replace(/["\\]/g, "\\$&")}"`;
+  return `${owned},users.cs.{${quoted}}`;
+};
+
+// Mutations must hit exactly one row I own; anything else reads as "not found".
+const notFoundOrForbidden = () =>
+  new Error("File not found or you don't have permission to change it");
+
+// The bucket is private: replace stored URLs with short-lived signed URLs. Signing goes
+// through the user's session, so storage RLS decides which objects can be signed.
+const withSignedUrls = async (
+  supabase: SessionClient,
+  files: FileDocument[],
+): Promise<FileDocument[]> => {
+  const paths = [...new Set(files.map((f) => f.bucketFileId).filter(Boolean))];
+  if (paths.length === 0) return files;
+
+  const { data, error } = await supabase.storage
+    .from(supabaseConfig.bucketId)
+    .createSignedUrls(paths, SIGNED_URL_TTL);
+  if (error) throw error;
+
+  const byPath = new Map(
+    data
+      .filter((d) => d.path && d.signedUrl && !d.error)
+      .map((d) => [d.path as string, d.signedUrl]),
+  );
+  return files.map((f) => ({ ...f, url: byPath.get(f.bucketFileId) ?? "" }));
+};
+
 // public.users.id for the signed-in user (files.owner references it).
-const getProfileId = async (
-  supabase: Awaited<ReturnType<typeof createSessionClient>>,
-  authUserId: string,
-) => {
+const getProfileId = async (supabase: SessionClient, authUserId: string) => {
   const { data, error } = await supabase
     .from(supabaseConfig.usersTable)
     .select("id")
@@ -122,12 +161,13 @@ export const getFiles = async ({
   limit,
 }: GetFilesProps) => {
   try {
-    const { supabase } = await getAuthUser();
+    const { supabase, user } = await getAuthUser();
 
-    // Visibility (owned by me OR shared with my email) is enforced by RLS — see supabase/schema.sql.
+    // Only files I own or that were explicitly shared with my email.
     let query = supabase
       .from(supabaseConfig.filesTable)
-      .select(FILE_SELECT, { count: "exact" });
+      .select(FILE_SELECT, { count: "exact" })
+      .or(ownedOrSharedFilter(user.id, user.email));
 
     if (types.length > 0) query = query.in("type", types);
 
@@ -147,8 +187,13 @@ export const getFiles = async ({
     if (error) throw error;
 
     // Keep the { documents, total } shape the pages already consume.
+    const documents = await withSignedUrls(
+      supabase,
+      (data ?? []) as unknown as FileDocument[],
+    );
+
     return parseStringify({
-      documents: (data ?? []) as unknown as FileDocument[],
+      documents,
       total: count ?? 0,
     });
   } catch (error) {
@@ -163,7 +208,7 @@ export const renameFile = async ({
   path,
 }: RenameFileProps) => {
   try {
-    const { supabase } = await getAuthUser();
+    const { supabase, user } = await getAuthUser();
 
     // The rename dialog starts with the full name ("photo.png"); don't append ".png" twice.
     const suffix = `.${extension}`.toLowerCase();
@@ -177,9 +222,11 @@ export const renameFile = async ({
       .from(supabaseConfig.filesTable)
       .update({ name: extension ? `${baseName}.${extension}` : baseName })
       .eq("id", fileId)
+      .eq(OWNER_COLUMN, user.id)
       .select(FILE_SELECT)
-      .single();
+      .maybeSingle();
     if (error) throw error;
+    if (!updatedFile) throw notFoundOrForbidden();
 
     revalidatePath(path);
     return parseStringify(updatedFile as unknown as FileDocument);
@@ -194,7 +241,7 @@ export const updateFileUsers = async ({
   path,
 }: UpdateFileUsersProps) => {
   try {
-    const { supabase } = await getAuthUser();
+    const { supabase, user } = await getAuthUser();
 
     // Normalise: trim, lowercase, drop blanks/invalid entries, de-duplicate.
     const users = [
@@ -209,9 +256,11 @@ export const updateFileUsers = async ({
       .from(supabaseConfig.filesTable)
       .update({ users })
       .eq("id", fileId)
+      .eq(OWNER_COLUMN, user.id)
       .select(FILE_SELECT)
-      .single();
+      .maybeSingle();
     if (error) throw error;
+    if (!updatedFile) throw notFoundOrForbidden();
 
     revalidatePath(path);
     return parseStringify(updatedFile as unknown as FileDocument);
@@ -222,17 +271,19 @@ export const updateFileUsers = async ({
 
 export const deleteFile = async ({ fileId, path }: DeleteFileProps) => {
   try {
-    const { supabase } = await getAuthUser();
+    const { supabase, user } = await getAuthUser();
 
-    // Delete the row first (RLS: owner only) and use the stored object path
+    // Delete the row first (owner only) and use the stored object path
     // rather than the client-supplied bucketFileId.
     const { data: deleted, error } = await supabase
       .from(supabaseConfig.filesTable)
       .delete()
       .eq("id", fileId)
+      .eq(OWNER_COLUMN, user.id)
       .select("bucketFileId")
-      .single();
+      .maybeSingle();
     if (error) throw error;
+    if (!deleted) throw notFoundOrForbidden();
 
     const { error: storageError } = await supabase.storage
       .from(supabaseConfig.bucketId)
@@ -250,12 +301,12 @@ export const deleteFile = async ({ fileId, path }: DeleteFileProps) => {
 export async function getTotalSpaceUsed() {
   try {
     const { supabase, user } = await getAuthUser();
-    const ownerId = await getProfileId(supabase, user.id);
 
+    // Storage usage counts only my own uploads, not files shared with me.
     const { data: files, error } = await supabase
       .from(supabaseConfig.filesTable)
       .select("type, size, created_at")
-      .eq("owner", ownerId);
+      .eq(OWNER_COLUMN, user.id);
     if (error) throw error;
 
     const totalSpace = {
@@ -286,6 +337,6 @@ export async function getTotalSpaceUsed() {
 
     return parseStringify(totalSpace);
   } catch (error) {
-    handleError(error, "Error calculating total space used:, ");
+    handleError(error, "Failed to calculate total space used");
   }
 }

@@ -21,13 +21,13 @@ const nextConfig: NextConfig = {
   partialPrefetching: true,
   images: {
     remotePatterns: [
-      // Thumbnails served from the public Supabase Storage bucket.
+      // Thumbnails: signed URLs from the private Supabase Storage bucket.
       ...(supabaseUrl
         ? [
             {
               protocol: supabaseUrl.protocol.replace(":", "") as "https" | "http",
               hostname: supabaseUrl.hostname,
-              pathname: "/storage/v1/object/public/**",
+              pathname: "/storage/v1/object/sign/files/**",
             },
           ]
         : []),

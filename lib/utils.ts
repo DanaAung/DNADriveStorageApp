@@ -30,11 +30,12 @@ export const getFileType = (fileName: string) => {
 };
 
 // Supabase Storage download URL (replaces the Appwrite /download endpoint).
-export const constructDownloadUrl = (bucketFileId: string) =>
-  `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/files/${bucketFileId
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/")}?download=`;
+// file.url is a signed URL (private bucket); Supabase serves it as an attachment
+// when `download` is present.
+export const constructDownloadUrl = (signedUrl: string, fileName = "") =>
+  signedUrl
+    ? `${signedUrl}${signedUrl.includes("?") ? "&" : "?"}download=${encodeURIComponent(fileName)}`
+    : "";
 
 // Total storage quota shown on the dashboard (matches getTotalSpaceUsed's `all`).
 export const TOTAL_STORAGE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB
