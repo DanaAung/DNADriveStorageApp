@@ -25,7 +25,7 @@ A modern, full-stack cloud storage and file management platform inspired by Goog
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/DanaAung/DNADriveStorageApp.git](https://github.com/DanaAung/DNADriveStorageApp.git)
+git clone https://github.com/DanaAung/DNADriveStorageApp.git
 cd DNADriveStorageApp
 
 2. Install Dependencies
